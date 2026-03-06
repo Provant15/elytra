@@ -1,0 +1,36 @@
+{
+  "upstream": {
+    "remote": "upstream",
+    "branch": "main",
+    "pinned_commit": null,
+    "last_sync": null
+  },
+  "categories": {
+    "database": {
+      "name": "Database",
+      "description": "Database provisioning and management",
+      "risk_default": "medium"
+    },
+    "ui": {
+      "name": "UI",
+      "description": "Frontend and admin interface changes",
+      "risk_default": "low"
+    },
+    "api": {
+      "name": "API",
+      "description": "API endpoint and contract changes",
+      "risk_default": "medium"
+    },
+    "security": {
+      "name": "Security",
+      "description": "Security fixes and improvements",
+      "risk_default": "high"
+    },
+    "config": {
+      "name": "Configuration",
+      "description": "Configuration and environment changes",
+      "risk_default": "low"
+    }
+  },
+  "patches": []
+}
