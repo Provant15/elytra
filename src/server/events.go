@@ -2,6 +2,7 @@ package server
 
 import (
 	"github.com/pyrohost/elytra/src/events"
+	"github.com/pyrohost/elytra/src/server/gamebridge"
 	"github.com/pyrohost/elytra/src/system"
 )
 
@@ -19,6 +20,11 @@ const (
 	TransferLogsEvent           = "transfer logs"
 	TransferStatusEvent         = "transfer status"
 	DeletedEvent                = "deleted"
+
+	// Player management events - re-exported from gamebridge package.
+	PlayerListEvent  = gamebridge.PlayerListEvent
+	PlayerJoinEvent  = gamebridge.PlayerJoinEvent
+	PlayerLeaveEvent = gamebridge.PlayerLeaveEvent
 )
 
 // Events returns the server's emitter instance.

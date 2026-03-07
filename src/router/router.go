@@ -120,6 +120,15 @@ func Configure(m *wserver.Manager, client remote.Client, jobManager *jobs.Manage
 			jobs.PUT("/:job_id", putUpdateJob)
 			jobs.DELETE("/:job_id", deleteJob)
 		}
+
+		// Game bridge player management endpoints.
+		players := server.Group("/players")
+		{
+			players.GET("", getServerPlayers)
+			players.POST("/action", postServerPlayerAction)
+			players.POST("/command", postServerPlayerCommand)
+			players.GET("/status", getServerPlayersStatus)
+		}
 	}
 
 	return router

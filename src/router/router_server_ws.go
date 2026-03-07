@@ -162,4 +162,7 @@ func getServerWebsocket(c *gin.Context) {
 			}
 		}(j)
 	}
+
+	// Clean up player subscription on disconnect to prevent subscriber count leaks.
+	handler.CleanupPlayerSubscription()
 }

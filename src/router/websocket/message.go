@@ -11,6 +11,8 @@ const (
 	SendServerLogsEvent        = Event("send logs")
 	SendCommandEvent           = Event("send command")
 	SendStatsEvent             = Event("send stats")
+	PlayersSubscribeEvent      = Event("players subscribe")
+	PlayersUnsubscribeEvent    = Event("players unsubscribe")
 	ErrorEvent                 = Event("daemon error")
 	JwtErrorEvent              = Event("jwt error")
 	ThrottledEvent             = Event("throttled")

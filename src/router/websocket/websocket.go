@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pyrohost/elytra/src/internal/models"
@@ -37,16 +38,18 @@ const (
 	PermissionReceiveInstall   = "admin.websocket.install"
 	PermissionReceiveTransfer  = "admin.websocket.transfer"
 	PermissionReceiveBackups   = "backup.read"
+	PermissionPlayersList      = "players.list"
 )
 
 type Handler struct {
-	sync.RWMutex `json:"-"`
-	Connection   *websocket.Conn `json:"-"`
-	jwt          *tokens.WebsocketPayload
-	server       *server.Server
-	ra           server.RequestActivity
-	uuid         uuid.UUID
-	limiter      *LimiterBucket
+	sync.RWMutex     `json:"-"`
+	Connection       *websocket.Conn `json:"-"`
+	jwt              *tokens.WebsocketPayload
+	server           *server.Server
+	ra               server.RequestActivity
+	uuid             uuid.UUID
+	limiter          *LimiterBucket
+	playerSubscribed atomic.Bool
 }
 
 var (
@@ -445,7 +448,40 @@ func (h *Handler) HandleInbound(ctx context.Context, m Message) error {
 			})
 			return nil
 		}
+	case PlayersSubscribeEvent:
+		{
+			if !h.GetJwt().HasPermission(PermissionPlayersList) {
+				return nil
+			}
+			// Idempotent: skip if already subscribed on this connection.
+			if h.playerSubscribed.CompareAndSwap(false, true) {
+				if sub := h.server.PlayerSubscriber(); sub != nil {
+					sub.Subscribe()
+				}
+			}
+			return nil
+		}
+	case PlayersUnsubscribeEvent:
+		{
+			if h.playerSubscribed.CompareAndSwap(true, false) {
+				if sub := h.server.PlayerSubscriber(); sub != nil {
+					sub.Unsubscribe()
+				}
+			}
+			return nil
+		}
 	}
 
 	return nil
+}
+
+// CleanupPlayerSubscription unsubscribes from player events if this
+// handler was subscribed. Called on websocket disconnect to prevent
+// subscriber count leaks.
+func (h *Handler) CleanupPlayerSubscription() {
+	if h.playerSubscribed.CompareAndSwap(true, false) {
+		if sub := h.server.PlayerSubscriber(); sub != nil {
+			sub.Unsubscribe()
+		}
+	}
 }

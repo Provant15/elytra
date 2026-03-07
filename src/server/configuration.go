@@ -14,6 +14,22 @@ type EggConfiguration struct {
 	// or basically any type of access on the server by any user. This is NOT the same
 	// as a per-user denylist, this is defined at the Egg level.
 	FileDenylist []string `json:"file_denylist"`
+
+	// Features is a list of egg feature flags (e.g. "minecraft_rcon")
+	// used to determine which game bridge implementation to use.
+	Features []string `json:"features"`
+}
+
+// HasFeature checks whether the server's egg has a specific feature flag.
+func (s *Server) HasFeature(feature string) bool {
+	s.cfg.mu.RLock()
+	defer s.cfg.mu.RUnlock()
+	for _, f := range s.cfg.Egg.Features {
+		if f == feature {
+			return true
+		}
+	}
+	return false
 }
 
 type ConfigurationMeta struct {

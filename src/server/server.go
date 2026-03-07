@@ -20,6 +20,7 @@ import (
 	"github.com/pyrohost/elytra/src/events"
 	"github.com/pyrohost/elytra/src/remote"
 	"github.com/pyrohost/elytra/src/server/filesystem"
+	"github.com/pyrohost/elytra/src/server/gamebridge"
 	"github.com/pyrohost/elytra/src/system"
 )
 
@@ -77,6 +78,15 @@ type Server struct {
 
 	logSink     *system.SinkPool
 	installSink *system.SinkPool
+
+	// Game bridge for player management (RCON, console fallback, etc.).
+	// Nil when no game bridge applies to this server's egg.
+	// Protected by bridgeMu for concurrent access from WS goroutines.
+	bridge   gamebridge.Bridge
+	bridgeMu sync.RWMutex
+
+	// Player list subscriber that manages RCON polling for websocket clients.
+	playerSub *gamebridge.Subscriber
 }
 
 // New returns a new server instance with a context and all of the default
@@ -106,10 +116,53 @@ func New(client remote.Client) (*Server, error) {
 	return &s, nil
 }
 
+// Bridge returns the game bridge for this server, or nil if none applies.
+func (s *Server) Bridge() gamebridge.Bridge {
+	s.bridgeMu.RLock()
+	defer s.bridgeMu.RUnlock()
+	return s.bridge
+}
+
+// SetBridge sets the game bridge for this server.
+func (s *Server) SetBridge(b gamebridge.Bridge) {
+	s.bridgeMu.Lock()
+	defer s.bridgeMu.Unlock()
+	s.bridge = b
+}
+
+// PlayerSubscriber returns the player list subscriber, or nil if no bridge is active.
+func (s *Server) PlayerSubscriber() *gamebridge.Subscriber {
+	s.bridgeMu.RLock()
+	defer s.bridgeMu.RUnlock()
+	return s.playerSub
+}
+
+// SetPlayerSubscriber sets the player list subscriber for this server.
+func (s *Server) SetPlayerSubscriber(sub *gamebridge.Subscriber) {
+	s.bridgeMu.Lock()
+	defer s.bridgeMu.Unlock()
+	s.playerSub = sub
+}
+
+// CleanupBridge shuts down the game bridge and player subscriber.
+func (s *Server) CleanupBridge() {
+	s.bridgeMu.Lock()
+	defer s.bridgeMu.Unlock()
+	if s.playerSub != nil {
+		s.playerSub.UnsubscribeAll()
+		s.playerSub = nil
+	}
+	if s.bridge != nil {
+		s.bridge.Close()
+		s.bridge = nil
+	}
+}
+
 // CleanupForDestroy stops all running background tasks for this server that are
 // using the context on the server struct. This will cancel any running install
 // processes for the server as well.
 func (s *Server) CleanupForDestroy() {
+	s.CleanupBridge()
 	s.CtxCancel()
 	s.Events().Destroy()
 	s.DestroyAllSinks()
@@ -332,6 +385,9 @@ func (s *Server) OnStateChange() {
 	if st == environment.ProcessOfflineState {
 		s.resources.Reset()
 		s.Events().Publish(StatsEvent, s.Proc())
+
+		// Clean up game bridge and player subscriber on server stop.
+		s.CleanupBridge()
 	}
 
 	// If server was in an online state, and is now in an offline state we should handle

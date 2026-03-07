@@ -78,6 +78,9 @@ var e = []string{
 	server.BackupRestoreCompletedEvent,
 	server.TransferLogsEvent,
 	server.TransferStatusEvent,
+	server.PlayerListEvent,
+	server.PlayerJoinEvent,
+	server.PlayerLeaveEvent,
 	"backup.status", // Real-time backup progress events... Should maybe make this an enum eventually like its buddies - ellie
 }
 
