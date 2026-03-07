@@ -1,0 +1,23 @@
+From edd9d6c6d8bd6f5c1aa4a0a8654fe325fe87626d Mon Sep 17 00:00:00 2001
+From: Provant15 <me@provant.dev>
+Date: Sat, 7 Mar 2026 20:17:19 +1000
+Subject: [PATCH 3/3] ci: change build environment to ubuntu-latest for Docker
+ image publishing
+
+
+diff --git a/.github/workflows/docker-publish.yml b/.github/workflows/docker-publish.yml
+index 76c5fca..79ee69f 100644
+--- a/.github/workflows/docker-publish.yml
++++ b/.github/workflows/docker-publish.yml
+@@ -11,7 +11,7 @@ env:
+ 
+ jobs:
+   build-and-push:
+-    runs-on: self-hosted
++    runs-on: ubuntu-latest
+     permissions:
+       contents: read
+       packages: write
+-- 
+2.43.0
+
