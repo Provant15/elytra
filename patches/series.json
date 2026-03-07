@@ -32,5 +32,16 @@
       "risk_default": "low"
     }
   },
-  "patches": []
+  "patches": [
+    {
+      "id": "0001",
+      "title": "feat add game bridge system with RCON player managem",
+      "file": "0001-feat-add-game-bridge-system-with-RCON-player-managem.patch",
+      "category": "config",
+      "description": "",
+      "author": null,
+      "date": "2026-03-07",
+      "risk": "low"
+    }
+  ]
 }

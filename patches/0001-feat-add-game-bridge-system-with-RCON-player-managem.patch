@@ -1,0 +1,1381 @@
+From 9fb45813ce03e0a0f22215ebfdeee538d70d9209 Mon Sep 17 00:00:00 2001
+From: Provant15 <me@provant.dev>
+Date: Sat, 7 Mar 2026 17:56:23 +1000
+Subject: [PATCH 1/1] feat: add game bridge system with RCON player management
+
+Add a game-agnostic bridge interface for communicating with game servers,
+with RCON implementation for Minecraft. Includes:
+
+- Game bridge interface with RCON and console fallback implementations
+- RCON auto-configuration (password generation, server.properties patching)
+- Player list polling with diff-based join/leave event emission
+- REST endpoints for player list, actions, commands, and bridge status
+- WebSocket subscription for real-time player events with ref counting
+- Input validation and sanitization against command injection
+- Exponential backoff on RCON errors with cached state retention
+
+diff --git a/go.mod b/go.mod
+index 080cbe2..1af1274 100644
+--- a/go.mod
++++ b/go.mod
+@@ -27,6 +27,7 @@ require (
+ 	github.com/glebarez/sqlite v1.11.0
+ 	github.com/go-co-op/gocron v1.37.0
+ 	github.com/google/uuid v1.6.0
++	github.com/gorcon/rcon v1.4.0
+ 	github.com/gorilla/websocket v1.5.3
+ 	github.com/iancoleman/strcase v0.3.0
+ 	github.com/icza/dyno v0.0.0-20230330125955-09f820a8d9c0
+@@ -45,6 +46,7 @@ require (
+ 	golang.org/x/crypto v0.46.0
+ 	golang.org/x/sync v0.19.0
+ 	golang.org/x/sys v0.39.0
++	golang.org/x/time v0.5.0
+ 	gopkg.in/ini.v1 v1.67.0
+ 	gopkg.in/yaml.v2 v2.4.0
+ 	gopkg.in/yaml.v3 v3.0.1
+@@ -137,7 +139,6 @@ require (
+ 	golang.org/x/net v0.47.0 // indirect
+ 	golang.org/x/term v0.38.0 // indirect
+ 	golang.org/x/text v0.32.0 // indirect
+-	golang.org/x/time v0.5.0 // indirect
+ 	golang.org/x/tools v0.39.0 // indirect
+ 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
+ 	google.golang.org/protobuf v1.36.9 // indirect
+diff --git a/go.sum b/go.sum
+index 80427f4..5b4bc50 100644
+--- a/go.sum
++++ b/go.sum
+@@ -185,6 +185,8 @@ github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
+ github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
+ github.com/googleapis/gax-go/v2 v2.0.4/go.mod h1:0Wqv26UfaUD9n4G6kQubkQ+KchISgw+vpHVxEJEs9eg=
+ github.com/googleapis/gax-go/v2 v2.0.5/go.mod h1:DWXyrwAJ9X0FpwwEdw+IPEYBICEFu5mhpdKc/us6bOk=
++github.com/gorcon/rcon v1.4.0 h1:pYwZ8Rhcgfh/LhdPBncecuEo5thoFvPIuMSWovz1FME=
++github.com/gorcon/rcon v1.4.0/go.mod h1:M6v6sNmr/NET9YIf+2rq+cIjTBridoy62uzQ58WgC1I=
+ github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aNNg=
+ github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
+ github.com/grpc-ecosystem/grpc-gateway/v2 v2.19.0 h1:Wqo399gCIufwto+VfwCSvsnfGpF/w5E9CNxSwbpD6No=
+diff --git a/src/router/router.go b/src/router/router.go
+index e632610..6846707 100644
+--- a/src/router/router.go
++++ b/src/router/router.go
+@@ -120,6 +120,15 @@ func Configure(m *wserver.Manager, client remote.Client, jobManager *jobs.Manage
+ 			jobs.PUT("/:job_id", putUpdateJob)
+ 			jobs.DELETE("/:job_id", deleteJob)
+ 		}
++
++		// Game bridge player management endpoints.
++		players := server.Group("/players")
++		{
++			players.GET("", getServerPlayers)
++			players.POST("/action", postServerPlayerAction)
++			players.POST("/command", postServerPlayerCommand)
++			players.GET("/status", getServerPlayersStatus)
++		}
+ 	}
+ 
+ 	return router
+diff --git a/src/router/router_server_gamebridge.go b/src/router/router_server_gamebridge.go
+new file mode 100644
+index 0000000..9cecb2e
+--- /dev/null
++++ b/src/router/router_server_gamebridge.go
+@@ -0,0 +1,124 @@
++package router
++
++import (
++	"net/http"
++
++	"github.com/gin-gonic/gin"
++
++	"github.com/pyrohost/elytra/src/server"
++	"github.com/pyrohost/elytra/src/server/gamebridge"
++)
++
++// requireBridge extracts the server and verifies it has an active game bridge
++// and is in a running state (same guard as postServerCommands).
++func requireBridge(c *gin.Context) (*server.Server, gamebridge.Bridge, bool) {
++	s := ExtractServer(c)
++
++	if running, err := s.Environment.IsRunning(c.Request.Context()); err != nil {
++		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to check server state"})
++		return nil, nil, false
++	} else if !running {
++		c.JSON(http.StatusBadGateway, gin.H{"error": "server must be online"})
++		return nil, nil, false
++	}
++
++	bridge := s.Bridge()
++	if bridge == nil {
++		c.JSON(http.StatusNotFound, gin.H{"error": "no game bridge available for this server"})
++		return nil, nil, false
++	}
++
++	return s, bridge, true
++}
++
++// getServerPlayers returns the current player list from the game bridge.
++func getServerPlayers(c *gin.Context) {
++	_, bridge, ok := requireBridge(c)
++	if !ok {
++		return
++	}
++
++	players, err := bridge.GetPlayers()
++	if err != nil {
++		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
++		return
++	}
++
++	c.JSON(http.StatusOK, players)
++}
++
++// postServerPlayerAction executes an action on a specific player.
++// Player name and action are in the request body (not URL) to avoid
++// encoding issues with special characters.
++func postServerPlayerAction(c *gin.Context) {
++	_, bridge, ok := requireBridge(c)
++	if !ok {
++		return
++	}
++
++	var body struct {
++		Player string            `json:"player" binding:"required"`
++		Action string            `json:"action" binding:"required"`
++		Params map[string]string `json:"params"`
++	}
++
++	if err := c.ShouldBindJSON(&body); err != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
++		return
++	}
++
++	// Validate player name against Minecraft's rules.
++	if !gamebridge.ValidPlayerName.MatchString(body.Player) {
++		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid player name"})
++		return
++	}
++
++	// Validate action against strict allowlist.
++	if !gamebridge.ValidActions[body.Action] {
++		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown action"})
++		return
++	}
++
++	result, err := bridge.ExecuteAction(body.Player, body.Action, body.Params)
++	if err != nil {
++		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
++		return
++	}
++
++	c.JSON(http.StatusOK, result)
++}
++
++// postServerPlayerCommand sends a raw command through the game bridge.
++func postServerPlayerCommand(c *gin.Context) {
++	_, bridge, ok := requireBridge(c)
++	if !ok {
++		return
++	}
++
++	var body struct {
++		Command string `json:"command" binding:"required"`
++	}
++
++	if err := c.ShouldBindJSON(&body); err != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
++		return
++	}
++
++	result, err := bridge.ExecuteCommand(body.Command)
++	if err != nil {
++		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
++		return
++	}
++
++	c.JSON(http.StatusOK, result)
++}
++
++// getServerPlayersStatus returns the game bridge connection status.
++func getServerPlayersStatus(c *gin.Context) {
++	_, bridge, ok := requireBridge(c)
++	if !ok {
++		return
++	}
++
++	c.JSON(http.StatusOK, bridge.Status())
++}
+diff --git a/src/router/router_server_ws.go b/src/router/router_server_ws.go
+index ca67d0d..04ba85e 100644
+--- a/src/router/router_server_ws.go
++++ b/src/router/router_server_ws.go
+@@ -162,4 +162,7 @@ func getServerWebsocket(c *gin.Context) {
+ 			}
+ 		}(j)
+ 	}
++
++	// Clean up player subscription on disconnect to prevent subscriber count leaks.
++	handler.CleanupPlayerSubscription()
+ }
+diff --git a/src/router/websocket/listeners.go b/src/router/websocket/listeners.go
+index ee69c11..f00b849 100644
+--- a/src/router/websocket/listeners.go
++++ b/src/router/websocket/listeners.go
+@@ -78,6 +78,9 @@ var e = []string{
+ 	server.BackupRestoreCompletedEvent,
+ 	server.TransferLogsEvent,
+ 	server.TransferStatusEvent,
++	server.PlayerListEvent,
++	server.PlayerJoinEvent,
++	server.PlayerLeaveEvent,
+ 	"backup.status", // Real-time backup progress events... Should maybe make this an enum eventually like its buddies - ellie
+ }
+ 
+diff --git a/src/router/websocket/message.go b/src/router/websocket/message.go
+index 8c2f876..a12136d 100644
+--- a/src/router/websocket/message.go
++++ b/src/router/websocket/message.go
+@@ -11,6 +11,8 @@ const (
+ 	SendServerLogsEvent        = Event("send logs")
+ 	SendCommandEvent           = Event("send command")
+ 	SendStatsEvent             = Event("send stats")
++	PlayersSubscribeEvent      = Event("players subscribe")
++	PlayersUnsubscribeEvent    = Event("players unsubscribe")
+ 	ErrorEvent                 = Event("daemon error")
+ 	JwtErrorEvent              = Event("jwt error")
+ 	ThrottledEvent             = Event("throttled")
+diff --git a/src/router/websocket/websocket.go b/src/router/websocket/websocket.go
+index 97c3661..acd5d3e 100644
+--- a/src/router/websocket/websocket.go
++++ b/src/router/websocket/websocket.go
+@@ -7,6 +7,7 @@ import (
+ 	"net/http"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/pyrohost/elytra/src/internal/models"
+@@ -37,16 +38,18 @@ const (
+ 	PermissionReceiveInstall   = "admin.websocket.install"
+ 	PermissionReceiveTransfer  = "admin.websocket.transfer"
+ 	PermissionReceiveBackups   = "backup.read"
++	PermissionPlayersList      = "players.list"
+ )
+ 
+ type Handler struct {
+-	sync.RWMutex `json:"-"`
+-	Connection   *websocket.Conn `json:"-"`
+-	jwt          *tokens.WebsocketPayload
+-	server       *server.Server
+-	ra           server.RequestActivity
+-	uuid         uuid.UUID
+-	limiter      *LimiterBucket
++	sync.RWMutex     `json:"-"`
++	Connection       *websocket.Conn `json:"-"`
++	jwt              *tokens.WebsocketPayload
++	server           *server.Server
++	ra               server.RequestActivity
++	uuid             uuid.UUID
++	limiter          *LimiterBucket
++	playerSubscribed atomic.Bool
+ }
+ 
+ var (
+@@ -445,7 +448,40 @@ func (h *Handler) HandleInbound(ctx context.Context, m Message) error {
+ 			})
+ 			return nil
+ 		}
++	case PlayersSubscribeEvent:
++		{
++			if !h.GetJwt().HasPermission(PermissionPlayersList) {
++				return nil
++			}
++			// Idempotent: skip if already subscribed on this connection.
++			if h.playerSubscribed.CompareAndSwap(false, true) {
++				if sub := h.server.PlayerSubscriber(); sub != nil {
++					sub.Subscribe()
++				}
++			}
++			return nil
++		}
++	case PlayersUnsubscribeEvent:
++		{
++			if h.playerSubscribed.CompareAndSwap(true, false) {
++				if sub := h.server.PlayerSubscriber(); sub != nil {
++					sub.Unsubscribe()
++				}
++			}
++			return nil
++		}
+ 	}
+ 
+ 	return nil
+ }
++
++// CleanupPlayerSubscription unsubscribes from player events if this
++// handler was subscribed. Called on websocket disconnect to prevent
++// subscriber count leaks.
++func (h *Handler) CleanupPlayerSubscription() {
++	if h.playerSubscribed.CompareAndSwap(true, false) {
++		if sub := h.server.PlayerSubscriber(); sub != nil {
++			sub.Unsubscribe()
++		}
++	}
++}
+diff --git a/src/server/configuration.go b/src/server/configuration.go
+index df01d66..98a44f3 100644
+--- a/src/server/configuration.go
++++ b/src/server/configuration.go
+@@ -14,6 +14,22 @@ type EggConfiguration struct {
+ 	// or basically any type of access on the server by any user. This is NOT the same
+ 	// as a per-user denylist, this is defined at the Egg level.
+ 	FileDenylist []string `json:"file_denylist"`
++
++	// Features is a list of egg feature flags (e.g. "minecraft_rcon")
++	// used to determine which game bridge implementation to use.
++	Features []string `json:"features"`
++}
++
++// HasFeature checks whether the server's egg has a specific feature flag.
++func (s *Server) HasFeature(feature string) bool {
++	s.cfg.mu.RLock()
++	defer s.cfg.mu.RUnlock()
++	for _, f := range s.cfg.Egg.Features {
++		if f == feature {
++			return true
++		}
++	}
++	return false
+ }
+ 
+ type ConfigurationMeta struct {
+diff --git a/src/server/events.go b/src/server/events.go
+index 9d9d0de..2545783 100644
+--- a/src/server/events.go
++++ b/src/server/events.go
+@@ -2,6 +2,7 @@ package server
+ 
+ import (
+ 	"github.com/pyrohost/elytra/src/events"
++	"github.com/pyrohost/elytra/src/server/gamebridge"
+ 	"github.com/pyrohost/elytra/src/system"
+ )
+ 
+@@ -19,6 +20,11 @@ const (
+ 	TransferLogsEvent           = "transfer logs"
+ 	TransferStatusEvent         = "transfer status"
+ 	DeletedEvent                = "deleted"
++
++	// Player management events - re-exported from gamebridge package.
++	PlayerListEvent  = gamebridge.PlayerListEvent
++	PlayerJoinEvent  = gamebridge.PlayerJoinEvent
++	PlayerLeaveEvent = gamebridge.PlayerLeaveEvent
+ )
+ 
+ // Events returns the server's emitter instance.
+diff --git a/src/server/gamebridge/bridge.go b/src/server/gamebridge/bridge.go
+new file mode 100644
+index 0000000..4351e90
+--- /dev/null
++++ b/src/server/gamebridge/bridge.go
+@@ -0,0 +1,90 @@
++package gamebridge
++
++import (
++	"regexp"
++	"time"
++)
++
++// Player represents a connected game player.
++type Player struct {
++	Name string `json:"name"`
++	UUID string `json:"uuid,omitempty"`
++}
++
++// PlayerList holds the current connected player state.
++type PlayerList struct {
++	Players []Player `json:"players"`
++	Count   int      `json:"count"`
++	Max     int      `json:"max"`
++}
++
++// ActionResult holds the outcome of a player action.
++type ActionResult struct {
++	Success  bool   `json:"success"`
++	Message  string `json:"message,omitempty"`
++	Response string `json:"response,omitempty"`
++}
++
++// BridgeStatus reports the current bridge connection state.
++type BridgeStatus struct {
++	Connected bool       `json:"connected"`
++	Mode      string     `json:"mode"` // "rcon" or "fallback"
++	Since     *time.Time `json:"since,omitempty"`
++}
++
++// ValidPlayerName matches Minecraft's player name rules (letters, digits, underscores, 1-16 chars).
++var ValidPlayerName = regexp.MustCompile(`^[a-zA-Z0-9_]{1,16}$`)
++
++// ValidActions is the strict allowlist of supported player actions.
++var ValidActions = map[string]bool{
++	"kick": true, "ban": true, "message": true, "smite": true,
++	"teleport": true, "gamemode": true, "op": true, "deop": true,
++}
++
++// validCoordinate matches Minecraft coordinate values: integers, decimals, or relative (~, ~10, ~-5.5).
++// Uses alternation to ensure at least one meaningful character (prevents empty match).
++var validCoordinate = regexp.MustCompile(`^(~(-?\d{1,10}(\.\d{1,5})?)?|-?\d{1,10}(\.\d{1,5})?)$`)
++
++// SanitizeTextParam strips control characters and limits length for text params
++// (reason, message) to prevent command injection via embedded newlines or
++// excessive payloads. Returns the sanitized string, safe for command interpolation.
++func SanitizeTextParam(s string, maxLen int) string {
++	// Strip any control characters (newlines, tabs, carriage returns, etc.).
++	var clean []rune
++	for _, r := range s {
++		if r >= 32 && r != 127 {
++			clean = append(clean, r)
++		}
++	}
++	result := string(clean)
++	if len(result) > maxLen {
++		result = result[:maxLen]
++	}
++	return result
++}
++
++// ValidateCoordinate checks that a coordinate string is a valid Minecraft coordinate.
++func ValidateCoordinate(s string) bool {
++	return validCoordinate.MatchString(s)
++}
++
++// Bridge is the game-agnostic interface for communicating with game servers.
++// Each game type (Minecraft RCON, console fallback, future Valheim, etc.)
++// provides its own implementation.
++type Bridge interface {
++	// GetPlayers returns the current connected player list.
++	GetPlayers() (PlayerList, error)
++
++	// ExecuteAction performs a named action on a player.
++	// Player name must match ValidPlayerName. Action must be in ValidActions.
++	ExecuteAction(player string, action string, params map[string]string) (ActionResult, error)
++
++	// ExecuteCommand sends a raw command and returns the response.
++	ExecuteCommand(command string) (ActionResult, error)
++
++	// Status returns the bridge connection status.
++	Status() BridgeStatus
++
++	// Close cleans up any connections held by the bridge.
++	Close() error
++}
+diff --git a/src/server/gamebridge/console_bridge.go b/src/server/gamebridge/console_bridge.go
+new file mode 100644
+index 0000000..1ed7520
+--- /dev/null
++++ b/src/server/gamebridge/console_bridge.go
+@@ -0,0 +1,168 @@
++package gamebridge
++
++import (
++	"fmt"
++	"regexp"
++	"strconv"
++	"strings"
++
++	"github.com/apex/log"
++	"github.com/pyrohost/elytra/src/environment"
++)
++
++// ConsoleBridge implements Bridge by sending commands through the Docker
++// container's stdin. This is the fallback when RCON is unavailable.
++type ConsoleBridge struct {
++	env environment.ProcessEnvironment
++	log *log.Entry
++}
++
++// NewConsoleBridge creates a console-based bridge.
++func NewConsoleBridge(env environment.ProcessEnvironment, logger *log.Entry) *ConsoleBridge {
++	return &ConsoleBridge{
++		env: env,
++		log: logger,
++	}
++}
++
++// GetPlayers sends the `list` command via console.
++// Console bridge cannot capture command output directly, so this returns
++// an empty list. RCON is the recommended mode for full functionality.
++func (b *ConsoleBridge) GetPlayers() (PlayerList, error) {
++	if err := b.env.SendCommand("list"); err != nil {
++		return PlayerList{}, fmt.Errorf("failed to send list command: %w", err)
++	}
++	return PlayerList{Players: []Player{}, Count: 0, Max: 0}, nil
++}
++
++// ExecuteAction sends the corresponding Minecraft command via console.
++// Validates player name and action before composing the command.
++func (b *ConsoleBridge) ExecuteAction(player string, action string, params map[string]string) (ActionResult, error) {
++	if !ValidPlayerName.MatchString(player) {
++		return ActionResult{Success: false, Message: "invalid player name"}, nil
++	}
++	if !ValidActions[action] {
++		return ActionResult{Success: false, Message: fmt.Sprintf("unknown action: %s", action)}, nil
++	}
++
++	var cmd string
++
++	switch action {
++	case "kick":
++		reason := SanitizeTextParam(params["reason"], 200)
++		if reason != "" {
++			cmd = fmt.Sprintf("kick %s %s", player, reason)
++		} else {
++			cmd = fmt.Sprintf("kick %s", player)
++		}
++	case "ban":
++		reason := SanitizeTextParam(params["reason"], 200)
++		if reason != "" {
++			cmd = fmt.Sprintf("ban %s %s", player, reason)
++		} else {
++			cmd = fmt.Sprintf("ban %s", player)
++		}
++	case "message":
++		msg := SanitizeTextParam(params["message"], 500)
++		if msg == "" {
++			return ActionResult{Success: false, Message: "message cannot be empty"}, nil
++		}
++		cmd = fmt.Sprintf("tell %s %s", player, msg)
++	case "smite":
++		cmd = fmt.Sprintf("execute at %s run summon lightning_bolt", player)
++	case "teleport":
++		if target := params["target"]; target != "" {
++			if !ValidPlayerName.MatchString(target) {
++				return ActionResult{Success: false, Message: "invalid target player name"}, nil
++			}
++			cmd = fmt.Sprintf("tp %s %s", player, target)
++		} else {
++			x, y, z := params["x"], params["y"], params["z"]
++			if !ValidateCoordinate(x) || !ValidateCoordinate(y) || !ValidateCoordinate(z) {
++				return ActionResult{Success: false, Message: "invalid coordinates"}, nil
++			}
++			cmd = fmt.Sprintf("tp %s %s %s %s", player, x, y, z)
++		}
++	case "gamemode":
++		mode := params["mode"]
++		validModes := map[string]bool{
++			"survival": true, "creative": true,
++			"adventure": true, "spectator": true,
++		}
++		if !validModes[mode] {
++			return ActionResult{Success: false, Message: "invalid gamemode"}, nil
++		}
++		cmd = fmt.Sprintf("gamemode %s %s", mode, player)
++	case "op":
++		cmd = fmt.Sprintf("op %s", player)
++	case "deop":
++		cmd = fmt.Sprintf("deop %s", player)
++	default:
++		return ActionResult{Success: false, Message: fmt.Sprintf("unknown action: %s", action)}, nil
++	}
++
++	if err := b.env.SendCommand(cmd); err != nil {
++		return ActionResult{Success: false, Message: err.Error()}, err
++	}
++
++	return ActionResult{
++		Success: true,
++		Message: "Command sent via console (no response available in fallback mode)",
++	}, nil
++}
++
++// ExecuteCommand sends a raw command via console.
++func (b *ConsoleBridge) ExecuteCommand(command string) (ActionResult, error) {
++	if err := b.env.SendCommand(command); err != nil {
++		return ActionResult{Success: false, Message: err.Error()}, err
++	}
++	return ActionResult{
++		Success: true,
++		Message: "Command sent via console",
++	}, nil
++}
++
++// Status returns the console bridge status (always "connected" if server is running).
++func (b *ConsoleBridge) Status() BridgeStatus {
++	return BridgeStatus{
++		Connected: true,
++		Mode:      "fallback",
++	}
++}
++
++// Close is a no-op for the console bridge.
++func (b *ConsoleBridge) Close() error {
++	return nil
++}
++
++// consoleListRegex matches the Minecraft `list` output from console.
++var consoleListRegex = regexp.MustCompile(
++	`There are (\d+) of a max of (\d+) players online:\s*(.*)`,
++)
++
++// ParseListOutput attempts to parse a Minecraft `/list` console output line.
++// Used by the subscriber when operating in fallback mode.
++func ParseListOutput(line string) (PlayerList, bool) {
++	matches := consoleListRegex.FindStringSubmatch(line)
++	if matches == nil {
++		return PlayerList{}, false
++	}
++
++	count, _ := strconv.Atoi(matches[1])
++	max, _ := strconv.Atoi(matches[2])
++
++	var players []Player
++	if count > 0 && strings.TrimSpace(matches[3]) != "" {
++		for _, name := range strings.Split(matches[3], ", ") {
++			name = strings.TrimSpace(name)
++			if name != "" {
++				players = append(players, Player{Name: name})
++			}
++		}
++	}
++	if players == nil {
++		players = []Player{}
++	}
++
++	return PlayerList{Players: players, Count: count, Max: max}, true
++}
+diff --git a/src/server/gamebridge/manager.go b/src/server/gamebridge/manager.go
+new file mode 100644
+index 0000000..e507306
+--- /dev/null
++++ b/src/server/gamebridge/manager.go
+@@ -0,0 +1,114 @@
++package gamebridge
++
++import (
++	"crypto/rand"
++	"encoding/hex"
++	"fmt"
++	"os"
++	"path/filepath"
++
++	"github.com/apex/log"
++	"github.com/magiconair/properties"
++	"github.com/pyrohost/elytra/src/environment"
++)
++
++const (
++	// FeatureMinecraftRCON is the egg feature flag for Minecraft RCON support.
++	FeatureMinecraftRCON = "minecraft_rcon"
++
++	// markerFile is written when Elytra auto-enables RCON.
++	// If the user later sets enable-rcon=false, Elytra respects the override.
++	markerFile = ".elytra-rcon-auto"
++)
++
++// ConfigureAndCreate inspects the server's egg features and filesystem to
++// determine which bridge to create. For Minecraft RCON, it ensures RCON is
++// enabled in server.properties. Returns nil if no bridge applies.
++func ConfigureAndCreate(
++	features []string,
++	serverRoot string,
++	env environment.ProcessEnvironment,
++	logger *log.Entry,
++) (Bridge, error) {
++	hasRCON := false
++	for _, f := range features {
++		if f == FeatureMinecraftRCON {
++			hasRCON = true
++			break
++		}
++	}
++
++	if !hasRCON {
++		return nil, nil
++	}
++
++	propsPath := filepath.Join(serverRoot, "server.properties")
++	markerPath := filepath.Join(serverRoot, markerFile)
++
++	// Check if server.properties exists yet (first start may not have it).
++	if _, err := os.Stat(propsPath); os.IsNotExist(err) {
++		logger.Debug("server.properties not found, skipping RCON auto-config")
++		return NewConsoleBridge(env, logger), nil
++	}
++
++	props, err := properties.LoadFile(propsPath, properties.UTF8)
++	if err != nil {
++		logger.WithError(err).Warn("failed to read server.properties for RCON config")
++		return NewConsoleBridge(env, logger), nil
++	}
++
++	rconEnabled := props.GetBool("enable-rcon", false)
++
++	if !rconEnabled {
++		// Check if we previously auto-enabled and the user disabled it.
++		if _, err := os.Stat(markerPath); err == nil {
++			// Marker exists but RCON is disabled - user explicitly turned it off.
++			logger.Info("RCON was auto-enabled but user disabled it, using console fallback")
++			return NewConsoleBridge(env, logger), nil
++		}
++
++		// Auto-enable RCON.
++		logger.Info("auto-enabling RCON in server.properties")
++		password, err := generatePassword(16)
++		if err != nil {
++			logger.WithError(err).Warn("failed to generate RCON password")
++			return NewConsoleBridge(env, logger), nil
++		}
++
++		props.Set("enable-rcon", "true")
++		props.Set("rcon.port", "25575")
++		props.Set("rcon.password", password)
++
++		f, err := os.OpenFile(propsPath, os.O_WRONLY|os.O_TRUNC, 0600)
++		if err != nil {
++			logger.WithError(err).Warn("failed to open server.properties for writing")
++			return NewConsoleBridge(env, logger), nil
++		}
++		if _, err := props.Write(f, properties.UTF8); err != nil {
++			f.Close()
++			logger.WithError(err).Warn("failed to write server.properties")
++			return NewConsoleBridge(env, logger), nil
++		}
++		f.Close()
++		// Ensure restrictive permissions (RCON password is in this file).
++		os.Chmod(propsPath, 0600)
++
++		// Write marker file.
++		if err := os.WriteFile(markerPath, []byte("auto-configured by elytra"), 0644); err != nil {
++			logger.WithError(err).Warn("failed to write RCON marker file")
++		}
++
++		logger.Info("RCON auto-configured successfully")
++	}
++
++	return NewRCONBridge(propsPath, logger), nil
++}
++
++// generatePassword creates a random hex password of the given byte length.
++func generatePassword(byteLen int) (string, error) {
++	b := make([]byte, byteLen)
++	if _, err := rand.Read(b); err != nil {
++		return "", fmt.Errorf("failed to generate random password: %w", err)
++	}
++	return hex.EncodeToString(b), nil
++}
+diff --git a/src/server/gamebridge/rcon_bridge.go b/src/server/gamebridge/rcon_bridge.go
+new file mode 100644
+index 0000000..c2b13ba
+--- /dev/null
++++ b/src/server/gamebridge/rcon_bridge.go
+@@ -0,0 +1,278 @@
++package gamebridge
++
++import (
++	"fmt"
++	"regexp"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/apex/log"
++	"github.com/cenkalti/backoff/v4"
++	"github.com/gorcon/rcon"
++	"github.com/magiconair/properties"
++)
++
++// RCONBridge implements Bridge using Minecraft's Source RCON protocol.
++type RCONBridge struct {
++	mu   sync.Mutex
++	conn *rcon.Conn
++	log  *log.Entry
++
++	// Connection details read from server.properties.
++	host     string
++	port     int
++	password string
++
++	// Path to the server.properties file within the server filesystem.
++	propsPath string
++
++	connected bool
++	connSince *time.Time
++}
++
++// NewRCONBridge creates a new RCON bridge. It does NOT connect immediately -
++// connections are established lazily on first use.
++func NewRCONBridge(propsPath string, logger *log.Entry) *RCONBridge {
++	return &RCONBridge{
++		propsPath: propsPath,
++		log:       logger,
++		host:      "127.0.0.1",
++	}
++}
++
++// loadCredentials reads RCON connection details from server.properties.
++func (b *RCONBridge) loadCredentials() error {
++	props, err := properties.LoadFile(b.propsPath, properties.UTF8)
++	if err != nil {
++		return fmt.Errorf("failed to read server.properties: %w", err)
++	}
++
++	b.port = props.GetInt("rcon.port", 25575)
++	b.password = props.GetString("rcon.password", "")
++	if b.password == "" {
++		return fmt.Errorf("rcon.password is empty in server.properties")
++	}
++
++	return nil
++}
++
++// ensureConnected lazily establishes the RCON connection with retry/backoff.
++func (b *RCONBridge) ensureConnected() error {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++
++	if b.conn != nil && b.connected {
++		return nil
++	}
++
++	if err := b.loadCredentials(); err != nil {
++		return err
++	}
++
++	addr := fmt.Sprintf("%s:%d", b.host, b.port)
++	// Intentionally do NOT log the password.
++	b.log.WithField("addr", addr).Info("connecting to RCON")
++
++	var conn *rcon.Conn
++	op := func() error {
++		var err error
++		conn, err = rcon.Dial(addr, b.password)
++		return err
++	}
++
++	eb := backoff.NewExponentialBackOff()
++	eb.MaxElapsedTime = 30 * time.Second
++	eb.InitialInterval = 1 * time.Second
++
++	if err := backoff.Retry(op, eb); err != nil {
++		return fmt.Errorf("failed to connect to RCON at %s: %w", addr, err)
++	}
++
++	b.conn = conn
++	b.connected = true
++	now := time.Now()
++	b.connSince = &now
++	b.log.Info("RCON connection established")
++	return nil
++}
++
++// execute sends a command via RCON with automatic reconnection.
++func (b *RCONBridge) execute(command string) (string, error) {
++	if err := b.ensureConnected(); err != nil {
++		return "", err
++	}
++
++	b.mu.Lock()
++	defer b.mu.Unlock()
++
++	resp, err := b.conn.Execute(command)
++	if err != nil {
++		// Connection lost - mark as disconnected so next call reconnects.
++		b.connected = false
++		if b.conn != nil {
++			b.conn.Close()
++		}
++		b.conn = nil
++		return "", fmt.Errorf("RCON command failed: %w", err)
++	}
++
++	return resp, nil
++}
++
++// listRegex matches Minecraft's /list response.
++// Format: "There are N of a max of M players online: Player1, Player2"
++var listRegex = regexp.MustCompile(
++	`There are (\d+) of a max of (\d+) players online:\s*(.*)`,
++)
++
++// GetPlayers queries the connected player list via RCON `list`.
++func (b *RCONBridge) GetPlayers() (PlayerList, error) {
++	resp, err := b.execute("list")
++	if err != nil {
++		return PlayerList{}, err
++	}
++
++	matches := listRegex.FindStringSubmatch(resp)
++	if matches == nil {
++		return PlayerList{Count: 0, Max: 0, Players: []Player{}}, nil
++	}
++
++	count, _ := strconv.Atoi(matches[1])
++	max, _ := strconv.Atoi(matches[2])
++
++	var players []Player
++	if count > 0 && strings.TrimSpace(matches[3]) != "" {
++		names := strings.Split(matches[3], ", ")
++		for _, name := range names {
++			name = strings.TrimSpace(name)
++			if name != "" {
++				players = append(players, Player{Name: name})
++			}
++		}
++	}
++	if players == nil {
++		players = []Player{}
++	}
++
++	return PlayerList{
++		Players: players,
++		Count:   count,
++		Max:     max,
++	}, nil
++}
++
++// ExecuteAction maps a named action to a Minecraft RCON command.
++// Validates player name and action before composing the command.
++func (b *RCONBridge) ExecuteAction(player string, action string, params map[string]string) (ActionResult, error) {
++	if !ValidPlayerName.MatchString(player) {
++		return ActionResult{Success: false, Message: "invalid player name"}, nil
++	}
++	if !ValidActions[action] {
++		return ActionResult{Success: false, Message: fmt.Sprintf("unknown action: %s", action)}, nil
++	}
++
++	var cmd string
++
++	switch action {
++	case "kick":
++		reason := SanitizeTextParam(params["reason"], 200)
++		if reason != "" {
++			cmd = fmt.Sprintf("kick %s %s", player, reason)
++		} else {
++			cmd = fmt.Sprintf("kick %s", player)
++		}
++	case "ban":
++		reason := SanitizeTextParam(params["reason"], 200)
++		if reason != "" {
++			cmd = fmt.Sprintf("ban %s %s", player, reason)
++		} else {
++			cmd = fmt.Sprintf("ban %s", player)
++		}
++	case "message":
++		msg := SanitizeTextParam(params["message"], 500)
++		if msg == "" {
++			return ActionResult{Success: false, Message: "message cannot be empty"}, nil
++		}
++		cmd = fmt.Sprintf("tell %s %s", player, msg)
++	case "smite":
++		cmd = fmt.Sprintf("execute at %s run summon lightning_bolt", player)
++	case "teleport":
++		target := params["target"]
++		if target != "" {
++			if !ValidPlayerName.MatchString(target) {
++				return ActionResult{Success: false, Message: "invalid target player name"}, nil
++			}
++			cmd = fmt.Sprintf("tp %s %s", player, target)
++		} else {
++			x, y, z := params["x"], params["y"], params["z"]
++			if !ValidateCoordinate(x) || !ValidateCoordinate(y) || !ValidateCoordinate(z) {
++				return ActionResult{Success: false, Message: "invalid coordinates"}, nil
++			}
++			cmd = fmt.Sprintf("tp %s %s %s %s", player, x, y, z)
++		}
++	case "gamemode":
++		mode := params["mode"]
++		validModes := map[string]bool{
++			"survival": true, "creative": true,
++			"adventure": true, "spectator": true,
++		}
++		if !validModes[mode] {
++			return ActionResult{Success: false, Message: "invalid gamemode"}, nil
++		}
++		cmd = fmt.Sprintf("gamemode %s %s", mode, player)
++	case "op":
++		cmd = fmt.Sprintf("op %s", player)
++	case "deop":
++		cmd = fmt.Sprintf("deop %s", player)
++	default:
++		return ActionResult{Success: false, Message: fmt.Sprintf("unknown action: %s", action)}, nil
++	}
++
++	resp, err := b.execute(cmd)
++	if err != nil {
++		return ActionResult{Success: false, Message: err.Error()}, err
++	}
++
++	return ActionResult{
++		Success:  true,
++		Response: resp,
++	}, nil
++}
++
++// ExecuteCommand sends a raw RCON command.
++func (b *RCONBridge) ExecuteCommand(command string) (ActionResult, error) {
++	resp, err := b.execute(command)
++	if err != nil {
++		return ActionResult{Success: false, Message: err.Error()}, err
++	}
++
++	return ActionResult{
++		Success:  true,
++		Response: resp,
++	}, nil
++}
++
++// Status returns the current RCON connection status.
++func (b *RCONBridge) Status() BridgeStatus {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	return BridgeStatus{
++		Connected: b.connected,
++		Mode:      "rcon",
++		Since:     b.connSince,
++	}
++}
++
++// Close shuts down the RCON connection.
++func (b *RCONBridge) Close() error {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	if b.conn != nil {
++		b.conn.Close()
++		b.conn = nil
++		b.connected = false
++	}
++	return nil
++}
+diff --git a/src/server/gamebridge/subscriber.go b/src/server/gamebridge/subscriber.go
+new file mode 100644
+index 0000000..212485a
+--- /dev/null
++++ b/src/server/gamebridge/subscriber.go
+@@ -0,0 +1,196 @@
++package gamebridge
++
++import (
++	"context"
++	"encoding/json"
++	"math/rand"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/apex/log"
++	"github.com/pyrohost/elytra/src/events"
++)
++
++const (
++	// PollInterval is the base interval for polling player changes.
++	// Actual interval includes +/-1s jitter to avoid thundering herd.
++	PollInterval = 5 * time.Second
++
++	// MaxBackoff is the maximum poll interval during error backoff.
++	MaxBackoff = 30 * time.Second
++
++	// Player event topic names published to the event bus.
++	PlayerListEvent  = "player list"
++	PlayerJoinEvent  = "player join"
++	PlayerLeaveEvent = "player leave"
++)
++
++// Subscriber manages the RCON polling lifecycle for player list updates.
++// It only polls when at least one websocket client is subscribed.
++type Subscriber struct {
++	bridge Bridge
++	bus    *events.Bus
++	log    *log.Entry
++
++	subscribers atomic.Int32
++	cancel      context.CancelFunc
++	mu          sync.Mutex
++
++	// cacheMu protects the cached player set from concurrent access
++	// (poll goroutine vs stopPolling/UnsubscribeAll).
++	cacheMu sync.Mutex
++
++	// cached is the last known player set, keyed by player name.
++	cached map[string]Player
++
++	// consecutiveErrors tracks sequential poll failures for backoff.
++	// Atomic to allow lock-free reads from currentInterval().
++	consecutiveErrors atomic.Int32
++}
++
++// NewSubscriber creates a subscriber that emits player events to the given bus.
++func NewSubscriber(bridge Bridge, bus *events.Bus, logger *log.Entry) *Subscriber {
++	return &Subscriber{
++		bridge: bridge,
++		bus:    bus,
++		log:    logger,
++		cached: make(map[string]Player),
++	}
++}
++
++// Subscribe increments the subscriber count and starts polling if this is the first.
++func (s *Subscriber) Subscribe() {
++	count := s.subscribers.Add(1)
++	s.log.WithField("subscribers", count).Debug("player subscriber added")
++
++	if count == 1 {
++		s.startPolling()
++	}
++}
++
++// Unsubscribe decrements the subscriber count and stops polling when zero.
++func (s *Subscriber) Unsubscribe() {
++	count := s.subscribers.Add(-1)
++	if count < 0 {
++		s.subscribers.Store(0)
++		count = 0
++	}
++	s.log.WithField("subscribers", count).Debug("player subscriber removed")
++
++	if count == 0 {
++		s.stopPolling()
++	}
++}
++
++// UnsubscribeAll removes all subscribers and stops polling.
++func (s *Subscriber) UnsubscribeAll() {
++	s.subscribers.Store(0)
++	s.stopPolling()
++}
++
++func (s *Subscriber) startPolling() {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	if s.cancel != nil {
++		return // Already polling.
++	}
++
++	ctx, cancel := context.WithCancel(context.Background())
++	s.cancel = cancel
++
++	s.log.Info("starting player list polling")
++	go s.pollLoop(ctx)
++}
++
++func (s *Subscriber) stopPolling() {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	if s.cancel != nil {
++		s.cancel()
++		s.cancel = nil
++		s.cacheMu.Lock()
++		s.cached = make(map[string]Player)
++		s.cacheMu.Unlock()
++		s.consecutiveErrors.Store(0)
++		s.log.Info("stopped player list polling")
++	}
++}
++
++func (s *Subscriber) pollLoop(ctx context.Context) {
++	// Immediately do the first poll.
++	s.poll()
++
++	for {
++		// Calculate interval with jitter (+/-1s) and error backoff.
++		interval := s.currentInterval()
++		jitter := time.Duration(rand.Int63n(int64(2*time.Second))) - time.Second
++		timer := time.NewTimer(interval + jitter)
++
++		select {
++		case <-ctx.Done():
++			timer.Stop()
++			return
++		case <-timer.C:
++			s.poll()
++		}
++	}
++}
++
++// currentInterval returns the poll interval, applying exponential backoff on errors.
++func (s *Subscriber) currentInterval() time.Duration {
++	errs := s.consecutiveErrors.Load()
++	if errs == 0 {
++		return PollInterval
++	}
++	bo := PollInterval * time.Duration(1<<errs)
++	if bo > MaxBackoff {
++		bo = MaxBackoff
++	}
++	return bo
++}
++
++func (s *Subscriber) poll() {
++	list, err := s.bridge.GetPlayers()
++
++	s.cacheMu.Lock()
++	defer s.cacheMu.Unlock()
++
++	if err != nil {
++		s.consecutiveErrors.Add(1)
++		s.log.WithError(err).WithField("backoff", s.currentInterval()).Warn("failed to poll player list, retaining cached state")
++		// On error: do NOT diff, do NOT emit leave events. Keep prior snapshot.
++		return
++	}
++	s.consecutiveErrors.Store(0)
++
++	// Build new player set.
++	newSet := make(map[string]Player, len(list.Players))
++	for _, p := range list.Players {
++		newSet[p.Name] = p
++	}
++
++	// Diff: find joins (in new but not cached).
++	for name, p := range newSet {
++		if _, existed := s.cached[name]; !existed {
++			data, _ := json.Marshal(p)
++			s.bus.Publish(PlayerJoinEvent, string(data))
++		}
++	}
++
++	// Diff: find leaves (in cached but not new).
++	for name, p := range s.cached {
++		if _, exists := newSet[name]; !exists {
++			data, _ := json.Marshal(p)
++			s.bus.Publish(PlayerLeaveEvent, string(data))
++		}
++	}
++
++	// Always emit the full list so subscribers have authoritative state.
++	data, _ := json.Marshal(list)
++	s.bus.Publish(PlayerListEvent, string(data))
++
++	s.cached = newSet
++}
+diff --git a/src/server/power.go b/src/server/power.go
+index ca7576e..3b0a714 100644
+--- a/src/server/power.go
++++ b/src/server/power.go
+@@ -10,6 +10,7 @@ import (
+ 
+ 	"github.com/pyrohost/elytra/src/config"
+ 	"github.com/pyrohost/elytra/src/environment"
++	"github.com/pyrohost/elytra/src/server/gamebridge"
+ )
+ 
+ type PowerAction string
+@@ -205,6 +206,21 @@ func (s *Server) onBeforeStart() error {
+ 	s.UpdateConfigurationFiles()
+ 	s.Log().Debug("updated server configuration files")
+ 
++	// Configure game bridge (RCON auto-config, bridge selection) if the
++	// server's egg declares a supported game feature.
++	if bridge, err := gamebridge.ConfigureAndCreate(
++		s.Config().Egg.Features,
++		s.Filesystem().Path(),
++		s.Environment,
++		s.Log(),
++	); err != nil {
++		s.Log().WithError(err).Warn("failed to configure game bridge")
++	} else if bridge != nil {
++		s.SetBridge(bridge)
++		s.SetPlayerSubscriber(gamebridge.NewSubscriber(bridge, s.Events(), s.Log()))
++		s.Log().WithField("mode", bridge.Status().Mode).Info("game bridge configured")
++	}
++
+ 	if config.Get().System.CheckPermissionsOnBoot {
+ 		s.PublishConsoleOutputFromDaemon("Ensuring file permissions are set correctly, this could take a few seconds...")
+ 		// Ensure all the server file permissions are set correctly before booting the process.
+diff --git a/src/server/server.go b/src/server/server.go
+index 321e293..bda7f34 100644
+--- a/src/server/server.go
++++ b/src/server/server.go
+@@ -20,6 +20,7 @@ import (
+ 	"github.com/pyrohost/elytra/src/events"
+ 	"github.com/pyrohost/elytra/src/remote"
+ 	"github.com/pyrohost/elytra/src/server/filesystem"
++	"github.com/pyrohost/elytra/src/server/gamebridge"
+ 	"github.com/pyrohost/elytra/src/system"
+ )
+ 
+@@ -77,6 +78,15 @@ type Server struct {
+ 
+ 	logSink     *system.SinkPool
+ 	installSink *system.SinkPool
++
++	// Game bridge for player management (RCON, console fallback, etc.).
++	// Nil when no game bridge applies to this server's egg.
++	// Protected by bridgeMu for concurrent access from WS goroutines.
++	bridge   gamebridge.Bridge
++	bridgeMu sync.RWMutex
++
++	// Player list subscriber that manages RCON polling for websocket clients.
++	playerSub *gamebridge.Subscriber
+ }
+ 
+ // New returns a new server instance with a context and all of the default
+@@ -106,10 +116,53 @@ func New(client remote.Client) (*Server, error) {
+ 	return &s, nil
+ }
+ 
++// Bridge returns the game bridge for this server, or nil if none applies.
++func (s *Server) Bridge() gamebridge.Bridge {
++	s.bridgeMu.RLock()
++	defer s.bridgeMu.RUnlock()
++	return s.bridge
++}
++
++// SetBridge sets the game bridge for this server.
++func (s *Server) SetBridge(b gamebridge.Bridge) {
++	s.bridgeMu.Lock()
++	defer s.bridgeMu.Unlock()
++	s.bridge = b
++}
++
++// PlayerSubscriber returns the player list subscriber, or nil if no bridge is active.
++func (s *Server) PlayerSubscriber() *gamebridge.Subscriber {
++	s.bridgeMu.RLock()
++	defer s.bridgeMu.RUnlock()
++	return s.playerSub
++}
++
++// SetPlayerSubscriber sets the player list subscriber for this server.
++func (s *Server) SetPlayerSubscriber(sub *gamebridge.Subscriber) {
++	s.bridgeMu.Lock()
++	defer s.bridgeMu.Unlock()
++	s.playerSub = sub
++}
++
++// CleanupBridge shuts down the game bridge and player subscriber.
++func (s *Server) CleanupBridge() {
++	s.bridgeMu.Lock()
++	defer s.bridgeMu.Unlock()
++	if s.playerSub != nil {
++		s.playerSub.UnsubscribeAll()
++		s.playerSub = nil
++	}
++	if s.bridge != nil {
++		s.bridge.Close()
++		s.bridge = nil
++	}
++}
++
+ // CleanupForDestroy stops all running background tasks for this server that are
+ // using the context on the server struct. This will cancel any running install
+ // processes for the server as well.
+ func (s *Server) CleanupForDestroy() {
++	s.CleanupBridge()
+ 	s.CtxCancel()
+ 	s.Events().Destroy()
+ 	s.DestroyAllSinks()
+@@ -332,6 +385,9 @@ func (s *Server) OnStateChange() {
+ 	if st == environment.ProcessOfflineState {
+ 		s.resources.Reset()
+ 		s.Events().Publish(StatsEvent, s.Proc())
++
++		// Clean up game bridge and player subscriber on server stop.
++		s.CleanupBridge()
+ 	}
+ 
+ 	// If server was in an online state, and is now in an offline state we should handle
+-- 
+2.43.0
+
