@@ -1,7 +1,7 @@
 From edd9d6c6d8bd6f5c1aa4a0a8654fe325fe87626d Mon Sep 17 00:00:00 2001
 From: Provant15 <me@provant.dev>
 Date: Sat, 7 Mar 2026 20:17:19 +1000
-Subject: [PATCH 3/3] ci: change build environment to ubuntu-latest for Docker
+Subject: [PATCH 3/5] ci: change build environment to ubuntu-latest for Docker
  image publishing
 
 

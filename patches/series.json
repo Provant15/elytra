@@ -62,6 +62,26 @@
       "author": null,
       "date": "2026-03-07",
       "risk": "low"
+    },
+    {
+      "id": "0004",
+      "title": "fix write machine id file on every server boot not j",
+      "file": "0004-fix-write-machine-id-file-on-every-server-boot-not-j.patch",
+      "category": "config",
+      "description": "",
+      "author": null,
+      "date": "2026-03-09",
+      "risk": "low"
+    },
+    {
+      "id": "0005",
+      "title": "fix connect RCON via container bridge IP and survive",
+      "file": "0005-fix-connect-RCON-via-container-bridge-IP-and-survive.patch",
+      "category": "config",
+      "description": "",
+      "author": null,
+      "date": "2026-03-09",
+      "risk": "low"
     }
   ]
 }

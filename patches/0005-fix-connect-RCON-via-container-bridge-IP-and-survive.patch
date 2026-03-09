@@ -1,0 +1,181 @@
+From 7d002a3424065c76955746c6ee062fc15a799318 Mon Sep 17 00:00:00 2001
+From: Provant15 <me@provant.dev>
+Date: Mon, 9 Mar 2026 20:59:33 +1000
+Subject: [PATCH 5/5] fix: connect RCON via container bridge IP and survive
+ daemon restarts
+
+RCON port 25575 is not in the server allocation list, so Docker does not
+map it to the host. Connect via the container's bridge network IP instead
+of 127.0.0.1 so the RCON bridge can reach the game server.
+
+Extract ConfigureBridge() as a public method on Server so it can be
+called from both onBeforeStart() (normal boot) and root.go (Elytra
+restart re-attachment). Previously, an Elytra daemon restart would leave
+the bridge nil for already-running servers until the game server itself
+was restarted.
+
+diff --git a/src/cmd/root.go b/src/cmd/root.go
+index 9deab4d..c168cc1 100644
+--- a/src/cmd/root.go
++++ b/src/cmd/root.go
+@@ -285,6 +285,11 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
+ 				if err := s.Sync(); err != nil {
+ 					s.Log().WithError(err).Error("failed to re-sync server configuration")
+ 				}
++
++				// Configure the game bridge for servers that are already running.
++				// Without this, an Elytra restart would leave the bridge nil until
++				// the game server itself is restarted.
++				s.ConfigureBridge()
+ 			}
+ 		})
+ 	}
+diff --git a/src/server/gamebridge/manager.go b/src/server/gamebridge/manager.go
+index e507306..6480426 100644
+--- a/src/server/gamebridge/manager.go
++++ b/src/server/gamebridge/manager.go
+@@ -24,10 +24,14 @@ const (
+ // ConfigureAndCreate inspects the server's egg features and filesystem to
+ // determine which bridge to create. For Minecraft RCON, it ensures RCON is
+ // enabled in server.properties. Returns nil if no bridge applies.
++//
++// containerIP is the game container's IP on the Docker bridge network, used
++// for RCON connections. Pass empty string to fall back to 127.0.0.1.
+ func ConfigureAndCreate(
+ 	features []string,
+ 	serverRoot string,
+ 	env environment.ProcessEnvironment,
++	containerIP string,
+ 	logger *log.Entry,
+ ) (Bridge, error) {
+ 	hasRCON := false
+@@ -101,7 +105,7 @@ func ConfigureAndCreate(
+ 		logger.Info("RCON auto-configured successfully")
+ 	}
+ 
+-	return NewRCONBridge(propsPath, logger), nil
++	return NewRCONBridge(propsPath, containerIP, logger), nil
+ }
+ 
+ // generatePassword creates a random hex password of the given byte length.
+diff --git a/src/server/gamebridge/rcon_bridge.go b/src/server/gamebridge/rcon_bridge.go
+index c2b13ba..b3bcf4f 100644
+--- a/src/server/gamebridge/rcon_bridge.go
++++ b/src/server/gamebridge/rcon_bridge.go
+@@ -34,11 +34,20 @@ type RCONBridge struct {
+ 
+ // NewRCONBridge creates a new RCON bridge. It does NOT connect immediately -
+ // connections are established lazily on first use.
+-func NewRCONBridge(propsPath string, logger *log.Entry) *RCONBridge {
++//
++// containerIP is the game container's IP on the Docker bridge network. RCON
++// listens inside the container on a port that is typically NOT mapped to the
++// host, so we connect via the container's bridge IP instead of 127.0.0.1.
++// If empty, falls back to 127.0.0.1 (works when the RCON port is host-mapped).
++func NewRCONBridge(propsPath string, containerIP string, logger *log.Entry) *RCONBridge {
++	host := containerIP
++	if host == "" {
++		host = "127.0.0.1"
++	}
+ 	return &RCONBridge{
+ 		propsPath: propsPath,
+ 		log:       logger,
+-		host:      "127.0.0.1",
++		host:      host,
+ 	}
+ }
+ 
+diff --git a/src/server/power.go b/src/server/power.go
+index 0e933ae..593c491 100644
+--- a/src/server/power.go
++++ b/src/server/power.go
+@@ -10,7 +10,6 @@ import (
+ 
+ 	"github.com/pyrohost/elytra/src/config"
+ 	"github.com/pyrohost/elytra/src/environment"
+-	"github.com/pyrohost/elytra/src/server/gamebridge"
+ )
+ 
+ type PowerAction string
+@@ -206,20 +205,8 @@ func (s *Server) onBeforeStart() error {
+ 	s.UpdateConfigurationFiles()
+ 	s.Log().Debug("updated server configuration files")
+ 
+-	// Configure game bridge (RCON auto-config, bridge selection) if the
+-	// server's egg declares a supported game feature.
+-	if bridge, err := gamebridge.ConfigureAndCreate(
+-		s.Config().Egg.Features,
+-		s.Filesystem().Path(),
+-		s.Environment,
+-		s.Log(),
+-	); err != nil {
+-		s.Log().WithError(err).Warn("failed to configure game bridge")
+-	} else if bridge != nil {
+-		s.SetBridge(bridge)
+-		s.SetPlayerSubscriber(gamebridge.NewSubscriber(bridge, s.Events(), s.Log()))
+-		s.Log().WithField("mode", bridge.Status().Mode).Info("game bridge configured")
+-	}
++	// Configure the game bridge (RCON, console fallback) if applicable.
++	s.ConfigureBridge()
+ 
+ 	if config.Get().System.CheckPermissionsOnBoot {
+ 		s.PublishConsoleOutputFromDaemon("Ensuring file permissions are set correctly, this could take a few seconds...")
+diff --git a/src/server/server.go b/src/server/server.go
+index 36d70b8..d7b0f1a 100644
+--- a/src/server/server.go
++++ b/src/server/server.go
+@@ -17,6 +17,7 @@ import (
+ 
+ 	"github.com/pyrohost/elytra/src/config"
+ 	"github.com/pyrohost/elytra/src/environment"
++	"github.com/pyrohost/elytra/src/environment/docker"
+ 	"github.com/pyrohost/elytra/src/events"
+ 	"github.com/pyrohost/elytra/src/remote"
+ 	"github.com/pyrohost/elytra/src/server/filesystem"
+@@ -158,6 +159,43 @@ func (s *Server) CleanupBridge() {
+ 	}
+ }
+ 
++// ConfigureBridge resolves the game container's Docker bridge IP and sets up the
++// appropriate game bridge (RCON, console fallback) based on the server's egg
++// features. This is called during server boot and when Elytra re-attaches to an
++// already-running container after a daemon restart.
++func (s *Server) ConfigureBridge() {
++	// Resolve the game container's IP on the Docker bridge network so the
++	// RCON bridge can connect directly (the RCON port is typically not mapped
++	// to the host).
++	var containerIP string
++	if e, ok := s.Environment.(*docker.Environment); ok {
++		if c, err := e.ContainerInspect(context.Background()); err == nil {
++			for _, net := range c.NetworkSettings.Networks {
++				if net.IPAddress != "" {
++					containerIP = net.IPAddress
++					break
++				}
++			}
++		}
++	}
++
++	// Configure game bridge (RCON auto-config, bridge selection) if the
++	// server's egg declares a supported game feature.
++	if bridge, err := gamebridge.ConfigureAndCreate(
++		s.Config().Egg.Features,
++		s.Filesystem().Path(),
++		s.Environment,
++		containerIP,
++		s.Log(),
++	); err != nil {
++		s.Log().WithError(err).Warn("failed to configure game bridge")
++	} else if bridge != nil {
++		s.SetBridge(bridge)
++		s.SetPlayerSubscriber(gamebridge.NewSubscriber(bridge, s.Events(), s.Log()))
++		s.Log().WithField("mode", bridge.Status().Mode).Info("game bridge configured")
++	}
++}
++
+ // CleanupForDestroy stops all running background tasks for this server that are
+ // using the context on the server struct. This will cancel any running install
+ // processes for the server as well.
+-- 
+2.43.0
+

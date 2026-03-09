@@ -1,7 +1,7 @@
 From 049a5d679d9ec2fb822e480a72e5319f003b0c30 Mon Sep 17 00:00:00 2001
 From: Provant15 <me@provant.dev>
 Date: Sat, 7 Mar 2026 20:11:21 +1000
-Subject: [PATCH 2/3] ci: add Docker build and publish workflow for fork
+Subject: [PATCH 2/5] ci: add Docker build and publish workflow for fork
 
 Builds and publishes to ghcr.io/provant15/elytra on push to fork/main.
 Targets linux/amd64 for Sigurd. Uses self-hosted runner with GHA cache.

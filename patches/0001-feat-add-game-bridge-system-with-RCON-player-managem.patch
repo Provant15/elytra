@@ -1,7 +1,7 @@
 From 9fb45813ce03e0a0f22215ebfdeee538d70d9209 Mon Sep 17 00:00:00 2001
 From: Provant15 <me@provant.dev>
 Date: Sat, 7 Mar 2026 17:56:23 +1000
-Subject: [PATCH 1/3] feat: add game bridge system with RCON player management
+Subject: [PATCH 1/5] feat: add game bridge system with RCON player management
 
 Add a game-agnostic bridge interface for communicating with game servers,
 with RCON implementation for Minecraft. Includes:

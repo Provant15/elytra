@@ -1,0 +1,87 @@
+From 2bed4d913b6284e27f0e76754359c50707676897 Mon Sep 17 00:00:00 2001
+From: Provant15 <me@provant.dev>
+Date: Mon, 9 Mar 2026 20:37:42 +1000
+Subject: [PATCH 4/5] fix: write machine-id file on every server boot, not just
+ installation
+
+EnsureMachineID was only called during server provisioning
+(CreateEnvironment), but the machine-id directory lives under /run
+which is cleared on host/container restarts. Extracting it into a
+reusable method and calling it from onBeforeStart ensures the file
+exists before Docker creates the game container with its bind mount.
+
+diff --git a/src/server/power.go b/src/server/power.go
+index 3b0a714..0e933ae 100644
+--- a/src/server/power.go
++++ b/src/server/power.go
+@@ -230,6 +230,14 @@ func (s *Server) onBeforeStart() error {
+ 		}
+ 	}
+ 
++	// Write the machine-id file before the Docker container is created. The
++	// container bind-mounts this file, so it must exist on disk first. This
++	// runs on every boot because /run is a tmpfs that gets cleared on
++	// host/container restarts.
++	if err := s.EnsureMachineID(); err != nil {
++		return errors.WithMessage(err, "failed to ensure machine-id file exists")
++	}
++
+ 	s.Log().Info("completed server preflight, starting boot process...")
+ 	return nil
+ }
+diff --git a/src/server/server.go b/src/server/server.go
+index bda7f34..36d70b8 100644
+--- a/src/server/server.go
++++ b/src/server/server.go
+@@ -306,6 +306,29 @@ func (s *Server) ReadLogfile(len int) ([]string, error) {
+ 	return s.Environment.Readlog(len)
+ }
+ 
++// EnsureMachineID writes the machine-id file for this server if machine-id
++// support is enabled. The file contains the server's UUID with dashes stripped,
++// and is bind-mounted into game containers as /etc/machine-id (required by
++// Hytale for token encryption).
++//
++// This must be called before every container creation, not just during
++// installation, because the machine-id directory lives under /run which is
++// cleared on host/container restarts.
++func (s *Server) EnsureMachineID() error {
++	cfg := config.Get()
++	if !cfg.System.MachineID.Enable {
++		return nil
++	}
++
++	p := filepath.Join(cfg.System.MachineID.Directory, s.ID())
++	machineID := append(bytes.ReplaceAll([]byte(s.ID()), []byte{'-'}, []byte{}), '\n')
++	if err := os.WriteFile(p, machineID, 0o644); err != nil {
++		return fmt.Errorf("failed to write machine-id (at '%s') for server '%s': %w", p, s.ID(), err)
++	}
++
++	return nil
++}
++
+ // Initializes a server instance. This will run through and ensure that the environment
+ // for the server is setup, and that all of the necessary files are created.
+ func (s *Server) CreateEnvironment() error {
+@@ -314,16 +337,8 @@ func (s *Server) CreateEnvironment() error {
+ 		return err
+ 	}
+ 
+-	cfg := config.Get()
+-	if cfg.System.MachineID.Enable {
+-		// Hytale wants a machine-id in order to encrypt tokens for the server. So
+-		// write a machine-id file for the server that contains the server's UUID
+-		// without any dashes.
+-		p := filepath.Join(cfg.System.MachineID.Directory, s.ID())
+-		machineID := append(bytes.ReplaceAll([]byte(s.ID()), []byte{'-'}, []byte{}), '\n')
+-		if err := os.WriteFile(p, machineID, 0o644); err != nil {
+-			return fmt.Errorf("failed to write machine-id (at '%s') for server '%s': %w", p, s.ID(), err)
+-		}
++	if err := s.EnsureMachineID(); err != nil {
++		return err
+ 	}
+ 
+ 	return s.Environment.Create()
+-- 
+2.43.0
+
