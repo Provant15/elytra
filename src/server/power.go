@@ -230,6 +230,14 @@ func (s *Server) onBeforeStart() error {
 		}
 	}
 
+	// Write the machine-id file before the Docker container is created. The
+	// container bind-mounts this file, so it must exist on disk first. This
+	// runs on every boot because /run is a tmpfs that gets cleared on
+	// host/container restarts.
+	if err := s.EnsureMachineID(); err != nil {
+		return errors.WithMessage(err, "failed to ensure machine-id file exists")
+	}
+
 	s.Log().Info("completed server preflight, starting boot process...")
 	return nil
 }
