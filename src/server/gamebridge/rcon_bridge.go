@@ -34,11 +34,20 @@ type RCONBridge struct {
 
 // NewRCONBridge creates a new RCON bridge. It does NOT connect immediately -
 // connections are established lazily on first use.
-func NewRCONBridge(propsPath string, logger *log.Entry) *RCONBridge {
+//
+// containerIP is the game container's IP on the Docker bridge network. RCON
+// listens inside the container on a port that is typically NOT mapped to the
+// host, so we connect via the container's bridge IP instead of 127.0.0.1.
+// If empty, falls back to 127.0.0.1 (works when the RCON port is host-mapped).
+func NewRCONBridge(propsPath string, containerIP string, logger *log.Entry) *RCONBridge {
+	host := containerIP
+	if host == "" {
+		host = "127.0.0.1"
+	}
 	return &RCONBridge{
 		propsPath: propsPath,
 		log:       logger,
-		host:      "127.0.0.1",
+		host:      host,
 	}
 }
 

@@ -285,6 +285,11 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 				if err := s.Sync(); err != nil {
 					s.Log().WithError(err).Error("failed to re-sync server configuration")
 				}
+
+				// Configure the game bridge for servers that are already running.
+				// Without this, an Elytra restart would leave the bridge nil until
+				// the game server itself is restarted.
+				s.ConfigureBridge()
 			}
 		})
 	}

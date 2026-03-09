@@ -24,10 +24,14 @@ const (
 // ConfigureAndCreate inspects the server's egg features and filesystem to
 // determine which bridge to create. For Minecraft RCON, it ensures RCON is
 // enabled in server.properties. Returns nil if no bridge applies.
+//
+// containerIP is the game container's IP on the Docker bridge network, used
+// for RCON connections. Pass empty string to fall back to 127.0.0.1.
 func ConfigureAndCreate(
 	features []string,
 	serverRoot string,
 	env environment.ProcessEnvironment,
+	containerIP string,
 	logger *log.Entry,
 ) (Bridge, error) {
 	hasRCON := false
@@ -101,7 +105,7 @@ func ConfigureAndCreate(
 		logger.Info("RCON auto-configured successfully")
 	}
 
-	return NewRCONBridge(propsPath, logger), nil
+	return NewRCONBridge(propsPath, containerIP, logger), nil
 }
 
 // generatePassword creates a random hex password of the given byte length.

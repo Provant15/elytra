@@ -10,7 +10,6 @@ import (
 
 	"github.com/pyrohost/elytra/src/config"
 	"github.com/pyrohost/elytra/src/environment"
-	"github.com/pyrohost/elytra/src/server/gamebridge"
 )
 
 type PowerAction string
@@ -206,20 +205,8 @@ func (s *Server) onBeforeStart() error {
 	s.UpdateConfigurationFiles()
 	s.Log().Debug("updated server configuration files")
 
-	// Configure game bridge (RCON auto-config, bridge selection) if the
-	// server's egg declares a supported game feature.
-	if bridge, err := gamebridge.ConfigureAndCreate(
-		s.Config().Egg.Features,
-		s.Filesystem().Path(),
-		s.Environment,
-		s.Log(),
-	); err != nil {
-		s.Log().WithError(err).Warn("failed to configure game bridge")
-	} else if bridge != nil {
-		s.SetBridge(bridge)
-		s.SetPlayerSubscriber(gamebridge.NewSubscriber(bridge, s.Events(), s.Log()))
-		s.Log().WithField("mode", bridge.Status().Mode).Info("game bridge configured")
-	}
+	// Configure the game bridge (RCON, console fallback) if applicable.
+	s.ConfigureBridge()
 
 	if config.Get().System.CheckPermissionsOnBoot {
 		s.PublishConsoleOutputFromDaemon("Ensuring file permissions are set correctly, this could take a few seconds...")
