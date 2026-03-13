@@ -23,4 +23,15 @@ func SetupJobs(manager *Manager, serverManager *server.Manager, client remote.Cl
 		return NewBackupDeleteAllJob(data, serverManager, client)
 	})
 
+	manager.RegisterJobType("archive_create", func(data map[string]interface{}) (Job, error) {
+		return NewArchiveCreateJob(data, serverManager, client)
+	})
+
+	manager.RegisterJobType("archive_restore", func(data map[string]interface{}) (Job, error) {
+		return NewArchiveRestoreJob(data, serverManager, client)
+	})
+
+	manager.RegisterJobType("archive_delete", func(data map[string]interface{}) (Job, error) {
+		return NewArchiveDeleteJob(data, serverManager, client)
+	})
 }
