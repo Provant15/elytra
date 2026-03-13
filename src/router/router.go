@@ -65,6 +65,8 @@ func Configure(m *wserver.Manager, client remote.Client, jobManager *jobs.Manage
 	protected.POST("/api/servers", postCreateServer)
 	protected.DELETE("/api/transfers/:server", deleteTransfer)
 	protected.POST("/api/deauthorize-user", postDeauthorizeUser)
+	protected.GET("/api/archives", getArchiveSnapshots)
+	protected.DELETE("/api/archives/:snapshot_id", deleteArchiveSnapshot)
 
 	// These are server specific routes, and require that the request be authorized, and
 	// that the server exist on the Daemon.
@@ -129,6 +131,10 @@ func Configure(m *wserver.Manager, client remote.Client, jobManager *jobs.Manage
 			players.POST("/command", postServerPlayerCommand)
 			players.GET("/status", getServerPlayersStatus)
 		}
+
+		// Archive management endpoints
+		server.POST("/archive", postServerArchive)
+		server.POST("/restore", postServerRestore)
 	}
 
 	return router
