@@ -131,7 +131,14 @@ func (s *Server) HandlePowerAction(action PowerAction, waitSeconds ...int) error
 			return err
 		}
 
-		return s.Environment.Start(s.Context())
+		if err := s.Environment.Start(s.Context()); err != nil {
+			return err
+		}
+
+		// Configure the game bridge now that the container is running and has
+		// a network IP for RCON connections.
+		s.ConfigureBridge()
+		return nil
 	case PowerActionStop:
 		fallthrough
 	case PowerActionRestart:
@@ -158,7 +165,12 @@ func (s *Server) HandlePowerAction(action PowerAction, waitSeconds ...int) error
 			return err
 		}
 
-		return s.Environment.Start(s.Context())
+		if err := s.Environment.Start(s.Context()); err != nil {
+			return err
+		}
+
+		s.ConfigureBridge()
+		return nil
 	case PowerActionTerminate:
 		return s.Environment.Terminate(s.Context(), "SIGKILL")
 	}
@@ -205,8 +217,9 @@ func (s *Server) onBeforeStart() error {
 	s.UpdateConfigurationFiles()
 	s.Log().Debug("updated server configuration files")
 
-	// Configure the game bridge (RCON, console fallback) if applicable.
-	s.ConfigureBridge()
+	// Ensure RCON is enabled in server.properties before the container starts.
+	// The actual bridge is created after Start() once the container IP is known.
+	s.PrepareGameBridge()
 
 	if config.Get().System.CheckPermissionsOnBoot {
 		s.PublishConsoleOutputFromDaemon("Ensuring file permissions are set correctly, this could take a few seconds...")

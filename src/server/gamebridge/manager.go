@@ -21,12 +21,80 @@ const (
 	markerFile = ".elytra-rcon-auto"
 )
 
-// ConfigureAndCreate inspects the server's egg features and filesystem to
-// determine which bridge to create. For Minecraft RCON, it ensures RCON is
-// enabled in server.properties. Returns nil if no bridge applies.
+// EnsureRCONConfig ensures RCON is enabled in server.properties for servers
+// with the minecraft_rcon egg feature. Call this before the game container
+// starts so the server process reads the RCON configuration on boot.
 //
-// containerIP is the game container's IP on the Docker bridge network, used
-// for RCON connections. Pass empty string to fall back to 127.0.0.1.
+// Bridge creation is handled separately by ConfigureAndCreate, which should
+// be called after the container starts (once the container's bridge network
+// IP is available).
+func EnsureRCONConfig(features []string, serverRoot string, logger *log.Entry) {
+	if !hasFeature(features, FeatureMinecraftRCON) {
+		return
+	}
+
+	propsPath := filepath.Join(serverRoot, "server.properties")
+	markerPath := filepath.Join(serverRoot, markerFile)
+
+	if _, err := os.Stat(propsPath); os.IsNotExist(err) {
+		logger.Debug("server.properties not found, skipping RCON pre-config")
+		return
+	}
+
+	props, err := properties.LoadFile(propsPath, properties.UTF8)
+	if err != nil {
+		logger.WithError(err).Warn("failed to read server.properties for RCON pre-config")
+		return
+	}
+
+	if props.GetBool("enable-rcon", false) {
+		return // RCON already enabled.
+	}
+
+	// If we previously auto-enabled and the user disabled it, respect that.
+	if _, err := os.Stat(markerPath); err == nil {
+		return
+	}
+
+	// Auto-enable RCON.
+	logger.Info("auto-enabling RCON in server.properties")
+	password, err := generatePassword(16)
+	if err != nil {
+		logger.WithError(err).Warn("failed to generate RCON password")
+		return
+	}
+
+	props.Set("enable-rcon", "true")
+	props.Set("rcon.port", "25575")
+	props.Set("rcon.password", password)
+
+	f, err := os.OpenFile(propsPath, os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		logger.WithError(err).Warn("failed to open server.properties for writing")
+		return
+	}
+	if _, err := props.Write(f, properties.UTF8); err != nil {
+		f.Close()
+		logger.WithError(err).Warn("failed to write server.properties")
+		return
+	}
+	f.Close()
+	os.Chmod(propsPath, 0600)
+
+	if err := os.WriteFile(markerPath, []byte("auto-configured by elytra"), 0644); err != nil {
+		logger.WithError(err).Warn("failed to write RCON marker file")
+	}
+
+	logger.Info("RCON auto-configured successfully")
+}
+
+// ConfigureAndCreate inspects the server's egg features and filesystem to
+// determine which bridge to create. Returns nil if no bridge applies.
+//
+// This should be called after the game container is running, so that
+// containerIP (the container's IP on the Docker bridge network) is available
+// for RCON connections. RCON auto-configuration in server.properties is
+// handled by EnsureRCONConfig, which runs before the container starts.
 func ConfigureAndCreate(
 	features []string,
 	serverRoot string,
@@ -34,78 +102,38 @@ func ConfigureAndCreate(
 	containerIP string,
 	logger *log.Entry,
 ) (Bridge, error) {
-	hasRCON := false
-	for _, f := range features {
-		if f == FeatureMinecraftRCON {
-			hasRCON = true
-			break
-		}
-	}
-
-	if !hasRCON {
+	if !hasFeature(features, FeatureMinecraftRCON) {
 		return nil, nil
 	}
 
 	propsPath := filepath.Join(serverRoot, "server.properties")
-	markerPath := filepath.Join(serverRoot, markerFile)
 
-	// Check if server.properties exists yet (first start may not have it).
 	if _, err := os.Stat(propsPath); os.IsNotExist(err) {
-		logger.Debug("server.properties not found, skipping RCON auto-config")
+		logger.Debug("server.properties not found, using console fallback")
 		return NewConsoleBridge(env, logger), nil
 	}
 
 	props, err := properties.LoadFile(propsPath, properties.UTF8)
 	if err != nil {
-		logger.WithError(err).Warn("failed to read server.properties for RCON config")
+		logger.WithError(err).Warn("failed to read server.properties")
 		return NewConsoleBridge(env, logger), nil
 	}
 
-	rconEnabled := props.GetBool("enable-rcon", false)
-
-	if !rconEnabled {
-		// Check if we previously auto-enabled and the user disabled it.
-		if _, err := os.Stat(markerPath); err == nil {
-			// Marker exists but RCON is disabled - user explicitly turned it off.
-			logger.Info("RCON was auto-enabled but user disabled it, using console fallback")
-			return NewConsoleBridge(env, logger), nil
-		}
-
-		// Auto-enable RCON.
-		logger.Info("auto-enabling RCON in server.properties")
-		password, err := generatePassword(16)
-		if err != nil {
-			logger.WithError(err).Warn("failed to generate RCON password")
-			return NewConsoleBridge(env, logger), nil
-		}
-
-		props.Set("enable-rcon", "true")
-		props.Set("rcon.port", "25575")
-		props.Set("rcon.password", password)
-
-		f, err := os.OpenFile(propsPath, os.O_WRONLY|os.O_TRUNC, 0600)
-		if err != nil {
-			logger.WithError(err).Warn("failed to open server.properties for writing")
-			return NewConsoleBridge(env, logger), nil
-		}
-		if _, err := props.Write(f, properties.UTF8); err != nil {
-			f.Close()
-			logger.WithError(err).Warn("failed to write server.properties")
-			return NewConsoleBridge(env, logger), nil
-		}
-		f.Close()
-		// Ensure restrictive permissions (RCON password is in this file).
-		os.Chmod(propsPath, 0600)
-
-		// Write marker file.
-		if err := os.WriteFile(markerPath, []byte("auto-configured by elytra"), 0644); err != nil {
-			logger.WithError(err).Warn("failed to write RCON marker file")
-		}
-
-		logger.Info("RCON auto-configured successfully")
+	if !props.GetBool("enable-rcon", false) {
+		return NewConsoleBridge(env, logger), nil
 	}
 
 	return NewRCONBridge(propsPath, containerIP, logger), nil
+}
+
+// hasFeature checks whether a feature flag is present in the list.
+func hasFeature(features []string, target string) bool {
+	for _, f := range features {
+		if f == target {
+			return true
+		}
+	}
+	return false
 }
 
 // generatePassword creates a random hex password of the given byte length.

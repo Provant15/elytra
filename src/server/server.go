@@ -159,10 +159,21 @@ func (s *Server) CleanupBridge() {
 	}
 }
 
-// ConfigureBridge resolves the game container's Docker bridge IP and sets up the
-// appropriate game bridge (RCON, console fallback) based on the server's egg
-// features. This is called during server boot and when Elytra re-attaches to an
-// already-running container after a daemon restart.
+// PrepareGameBridge ensures RCON is configured in server.properties before
+// the game container starts. This only handles auto-configuration; the actual
+// bridge is created by ConfigureBridge after the container is running.
+func (s *Server) PrepareGameBridge() {
+	gamebridge.EnsureRCONConfig(
+		s.Config().Egg.Features,
+		s.Filesystem().Path(),
+		s.Log(),
+	)
+}
+
+// ConfigureBridge resolves the game container's Docker bridge IP and sets up
+// the appropriate game bridge (RCON, console fallback) based on the server's
+// egg features. This must be called after the container is running so the
+// container's network IP can be resolved for RCON connections.
 func (s *Server) ConfigureBridge() {
 	// Resolve the game container's IP on the Docker bridge network so the
 	// RCON bridge can connect directly (the RCON port is typically not mapped
@@ -179,8 +190,6 @@ func (s *Server) ConfigureBridge() {
 		}
 	}
 
-	// Configure game bridge (RCON auto-config, bridge selection) if the
-	// server's egg declares a supported game feature.
 	if bridge, err := gamebridge.ConfigureAndCreate(
 		s.Config().Egg.Features,
 		s.Filesystem().Path(),
@@ -190,6 +199,7 @@ func (s *Server) ConfigureBridge() {
 	); err != nil {
 		s.Log().WithError(err).Warn("failed to configure game bridge")
 	} else if bridge != nil {
+		s.CleanupBridge()
 		s.SetBridge(bridge)
 		s.SetPlayerSubscriber(gamebridge.NewSubscriber(bridge, s.Events(), s.Log()))
 		s.Log().WithField("mode", bridge.Status().Mode).Info("game bridge configured")
